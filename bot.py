@@ -13,8 +13,14 @@ from aiogram.types import (
 
 # ---------- НАСТРОЙКИ ----------
 
-API_TOKEN = os.getenv("API_TOKEN")          # токен бота из BotFather (ставишь в Render)
-DATABASE_URL = os.getenv("DATABASE_URL")    # PostgreSQL URL (ставишь в Render)
+# Берём токен и URL базы из переменных окружения
+API_TOKEN = os.environ.get("API_TOKEN")
+DATABASE_URL = os.environ.get("DATABASE_URL")
+
+# Для отладки: покажем, какие переменные вообще видит процесс
+print("DEBUG: ENV KEYS =", list(os.environ.keys()))
+print("DEBUG: API_TOKEN is", "SET" if API_TOKEN else "MISSING")
+print("DEBUG: DATABASE_URL is", "SET" if DATABASE_URL else "MISSING")
 
 if not API_TOKEN:
     raise ValueError("Не задан API_TOKEN в переменных окружения")
