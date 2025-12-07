@@ -1,4 +1,3 @@
-# bot.py
 import logging
 import os
 
@@ -12,8 +11,6 @@ from aiogram.types import (
 )
 
 logging.basicConfig(level=logging.INFO)
-
-# ---------- НАСТРОЙКИ ----------
 
 API_TOKEN = os.environ.get("API_TOKEN")
 DATABASE_URL = os.environ.get("DATABASE_URL")
@@ -29,16 +26,13 @@ dp = Dispatcher(bot)
 DESIGNER_LINK = "https://t.me/kitchme_design"
 BONUS_LINK = "https://disk.yandex.ru/d/TeEMNTquvbJMjg"
 
-# URL сервиса на Render
-WEBHOOK_HOST = os.environ.get("WEBHOOK_HOST")  # например: https://kitchme-bot.onrender.com
+WEBHOOK_HOST = os.environ.get("WEBHOOK_HOST")  # https://kitchme-bot.onrender.com
 WEBHOOK_PATH = "/webhook"
 WEBHOOK_URL = (WEBHOOK_HOST or "").rstrip("/") + WEBHOOK_PATH
 
 WEBAPP_HOST = "0.0.0.0"
 WEBAPP_PORT = int(os.environ.get("PORT", 8000))
 
-
-# ---------- БАЗА ДАННЫХ (PostgreSQL) ----------
 
 def get_conn():
     return psycopg2.connect(DATABASE_URL, sslmode="require")
@@ -83,16 +77,12 @@ def add_or_update_user(user: types.User):
     conn.close()
 
 
-# ---------- КЛАВИАТУРА ----------
-
 def main_menu():
     kb = ReplyKeyboardMarkup(resize_keyboard=True)
     kb.add(KeyboardButton("🎁 Забрать бонусы"))
     kb.add(KeyboardButton("📞 Получить консультацию дизайнера"))
     return kb
 
-
-# ---------- ХЕНДЛЕРЫ ----------
 
 @dp.message_handler(commands=["start"])
 async def cmd_start(message: types.Message):
@@ -130,8 +120,6 @@ async def handle_consult(message: types.Message):
     kb.add(InlineKeyboardButton("Написать дизайнеру", url=DESIGNER_LINK))
     await message.answer(text, reply_markup=kb)
 
-
-# ---------- СТАРТ / ОСТАНОВКА (WEBHOOK) ----------
 
 async def on_startup(dispatcher: Dispatcher):
     init_db()
