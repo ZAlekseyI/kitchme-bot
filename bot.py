@@ -11,23 +11,17 @@ from aiogram.types import (
     InlineKeyboardButton,
 )
 
+logging.basicConfig(level=logging.INFO)
+
 # ---------- НАСТРОЙКИ ----------
 
-# Берём токен и URL базы из переменных окружения
 API_TOKEN = os.environ.get("API_TOKEN")
 DATABASE_URL = os.environ.get("DATABASE_URL")
-
-# Для отладки: покажем, какие переменные вообще видит процесс
-print("DEBUG: ENV KEYS =", list(os.environ.keys()))
-print("DEBUG: API_TOKEN is", "SET" if API_TOKEN else "MISSING")
-print("DEBUG: DATABASE_URL is", "SET" if DATABASE_URL else "MISSING")
 
 if not API_TOKEN:
     raise ValueError("Не задан API_TOKEN в переменных окружения")
 if not DATABASE_URL:
     raise ValueError("Не задан DATABASE_URL в переменных окружения")
-
-logging.basicConfig(level=logging.INFO)
 
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher(bot)
@@ -35,11 +29,18 @@ dp = Dispatcher(bot)
 DESIGNER_LINK = "https://t.me/kitchme_design"
 BONUS_LINK = "https://disk.yandex.ru/d/TeEMNTquvbJMjg"
 
+# URL сервиса на Render
+WEBHOOK_HOST = os.environ.get("WEBHOOK_HOST")  # например: https://kitchme-bot.onrender.com
+WEBHOOK_PATH = "/webhook"
+WEBHOOK_URL = (WEBHOOK_HOST or "").rstrip("/") + WEBHOOK_PATH
+
+WEBAPP_HOST = "0.0.0.0"
+WEBAPP_PORT = int(os.environ.get("PORT", 8000))
+
 
 # ---------- БАЗА ДАННЫХ (PostgreSQL) ----------
 
 def get_conn():
-    # Для Render обычно нужен SSL
     return psycopg2.connect(DATABASE_URL, sslmode="require")
 
 
@@ -95,7 +96,6 @@ def main_menu():
 
 @dp.message_handler(commands=["start"])
 async def cmd_start(message: types.Message):
-    # Сохраняем пользователя в базе
     add_or_update_user(message.from_user)
 
     text = (
@@ -131,8 +131,33 @@ async def handle_consult(message: types.Message):
     await message.answer(text, reply_markup=kb)
 
 
-# ---------- ЗАПУСК ----------
+# ---------- СТАРТ / ОСТАНОВКА (WEBHOOK) ----------
+
+async def on_startup(dispatcher: Dispatcher):
+    init_db()
+
+    if not WEBHOOK_HOST:
+        logging.warning("WEBHOOK_HOST не задан, webhook не будет установлен")
+        return
+
+    await bot.delete_webhook()
+    await bot.set_webhook(WEBHOOK_URL)
+    logging.info(f"Webhook установлен: {WEBHOOK_URL}")
+
+
+async def on_shutdown(dispatcher: Dispatcher):
+    logging.info("Отключаем webhook...")
+    await bot.delete_webhook()
+    logging.info("Webhook удалён. Остановка бота.")
+
 
 if __name__ == "__main__":
-    init_db()
-    executor.start_polling(dp, skip_updates=True)
+    executor.start_webhook(
+        dispatcher=dp,
+        webhook_path=WEBHOOK_PATH,
+        on_startup=on_startup,
+        on_shutdown=on_shutdown,
+        skip_updates=True,
+        host=WEBAPP_HOST,
+        port=WEBAPP_PORT,
+    )
