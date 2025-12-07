@@ -138,6 +138,22 @@ async def handle_consult(message: types.Message):
     kb.add(InlineKeyboardButton("Написать дизайнеру", url=DESIGNER_LINK))
     await message.answer(text, reply_markup=kb)
 
+@dp.message_handler(commands=["help"])
+async def cmd_help(message: types.Message):
+    await message.answer("Я помогу с кухней или шкафом на заказ. Нажмите /start чтобы открыть меню.")
+
+@dp.message_handler(commands=["about"])
+async def cmd_about(message: types.Message):
+    await message.answer("Я бот студии корпусной мебели kitchME. Выдаю бонусы и помогаю с выбором.")
+
+@dp.message_handler(commands=["bonus"])
+async def cmd_bonus_cmd(message: types.Message):
+    await handle_bonuses(message)
+
+@dp.message_handler(commands=["consult"])
+async def cmd_consult_cmd(message: types.Message):
+    await handle_consult(message)
+
 
 # ---------- СТАРТ / ОСТАНОВКА (WEBHOOK) ----------
 
