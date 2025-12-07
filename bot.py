@@ -10,7 +10,12 @@ from aiogram.types import (
     InlineKeyboardButton,
 )
 
+# ---------- ЛОГИ ----------
+
 logging.basicConfig(level=logging.INFO)
+logging.info("=== kitchME BOT STARTED IN WEBHOOK MODE ===")
+
+# ---------- НАСТРОЙКИ ----------
 
 API_TOKEN = os.environ.get("API_TOKEN")
 DATABASE_URL = os.environ.get("DATABASE_URL")
@@ -26,7 +31,9 @@ dp = Dispatcher(bot)
 DESIGNER_LINK = "https://t.me/kitchme_design"
 BONUS_LINK = "https://disk.yandex.ru/d/TeEMNTquvbJMjg"
 
-WEBHOOK_HOST = os.environ.get("WEBHOOK_HOST")  # https://kitchme-bot.onrender.com
+# URL сервиса на Render. В ENV добавлено:
+# WEBHOOK_HOST = https://kitchme-bot.onrender.com
+WEBHOOK_HOST = os.environ.get("WEBHOOK_HOST")
 WEBHOOK_PATH = "/webhook"
 WEBHOOK_URL = (WEBHOOK_HOST or "").rstrip("/") + WEBHOOK_PATH
 
@@ -34,11 +41,15 @@ WEBAPP_HOST = "0.0.0.0"
 WEBAPP_PORT = int(os.environ.get("PORT", 8000))
 
 
+# ---------- БАЗА ДАННЫХ (PostgreSQL) ----------
+
 def get_conn():
+    """Подключение к PostgreSQL."""
     return psycopg2.connect(DATABASE_URL, sslmode="require")
 
 
 def init_db():
+    """Создаём таблицу users, если её ещё нет."""
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
@@ -56,9 +67,11 @@ def init_db():
     conn.commit()
     cur.close()
     conn.close()
+    logging.info("Таблица users проверена/создана")
 
 
 def add_or_update_user(user: types.User):
+    """Сохраняем пользователя в базу (или обновляем данные)."""
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
@@ -75,14 +88,19 @@ def add_or_update_user(user: types.User):
     conn.commit()
     cur.close()
     conn.close()
+    logging.info(f"Пользователь {user.id} сохранён/обновлён")
 
 
-def main_menu():
+# ---------- КЛАВИАТУРА ----------
+
+def main_menu() -> ReplyKeyboardMarkup:
     kb = ReplyKeyboardMarkup(resize_keyboard=True)
     kb.add(KeyboardButton("🎁 Забрать бонусы"))
     kb.add(KeyboardButton("📞 Получить консультацию дизайнера"))
     return kb
 
+
+# ---------- ХЕНДЛЕРЫ ----------
 
 @dp.message_handler(commands=["start"])
 async def cmd_start(message: types.Message):
@@ -121,11 +139,14 @@ async def handle_consult(message: types.Message):
     await message.answer(text, reply_markup=kb)
 
 
+# ---------- СТАРТ / ОСТАНОВКА (WEBHOOK) ----------
+
 async def on_startup(dispatcher: Dispatcher):
+    logging.info("Запуск бота, инициализация БД...")
     init_db()
 
     if not WEBHOOK_HOST:
-        logging.warning("WEBHOOK_HOST не задан, webhook не будет установлен")
+        logging.warning("WEBHOOK_HOST не задан, webhook НЕ будет установлен")
         return
 
     await bot.delete_webhook()
