@@ -4,12 +4,17 @@ import os
 
 import psycopg2
 from aiogram import Bot, Dispatcher, executor, types
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import (
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+)
 
 # ---------- НАСТРОЙКИ ----------
 
-API_TOKEN = os.getenv("API_TOKEN")          # токен бота из BotFather
-DATABASE_URL = os.getenv("DATABASE_URL")    # строка подключения к PostgreSQL (Render)
+API_TOKEN = os.getenv("API_TOKEN")          # токен бота из BotFather (ставишь в Render)
+DATABASE_URL = os.getenv("DATABASE_URL")    # PostgreSQL URL (ставишь в Render)
 
 if not API_TOKEN:
     raise ValueError("Не задан API_TOKEN в переменных окружения")
@@ -21,18 +26,22 @@ logging.basicConfig(level=logging.INFO)
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher(bot)
 
+DESIGNER_LINK = "https://t.me/kitchme_design"
+BONUS_LINK = "https://disk.yandex.ru/d/TeEMNTquvbJMjg"
+
 
 # ---------- БАЗА ДАННЫХ (PostgreSQL) ----------
 
 def get_conn():
-    # Render обычно требует SSL, поэтому sslmode=require
+    # Для Render обычно нужен SSL
     return psycopg2.connect(DATABASE_URL, sslmode="require")
 
 
 def init_db():
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("""
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS users (
             id SERIAL PRIMARY KEY,
             telegram_id BIGINT UNIQUE,
@@ -41,7 +50,8 @@ def init_db():
             last_name TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
-    """)
+        """
+    )
     conn.commit()
     cur.close()
     conn.close()
@@ -50,14 +60,17 @@ def init_db():
 def add_or_update_user(user: types.User):
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("""
+    cur.execute(
+        """
         INSERT INTO users (telegram_id, username, first_name, last_name)
         VALUES (%s, %s, %s, %s)
         ON CONFLICT (telegram_id) DO UPDATE SET
             username = EXCLUDED.username,
             first_name = EXCLUDED.first_name,
             last_name = EXCLUDED.last_name;
-    """, (user.id, user.username, user.first_name, user.last_name))
+        """,
+        (user.id, user.username, user.first_name, user.last_name),
+    )
     conn.commit()
     cur.close()
     conn.close()
@@ -94,7 +107,7 @@ async def handle_bonuses(message: types.Message):
     text = (
         "🎁 Ваши бонусы готовы!\n\n"
         "Скачивайте по ссылке ниже ⤵️\n\n"
-        "https://disk.yandex.ru/\n\n"  # ← сюда вставь свою реальную ссылку
+        f"{BONUS_LINK}\n\n"
         "Есть вопросы по вашей кухне?\n"
         "Наши дизайнеры готовы помочь — бесплатно."
     )
@@ -103,14 +116,12 @@ async def handle_bonuses(message: types.Message):
 
 @dp.message_handler(lambda m: m.text == "📞 Получить консультацию дизайнера")
 async def handle_consult(message: types.Message):
-    designer_link = "https://t.me/ВАШ_ЮЗЕРНЕЙМ"  # ← сюда вставь ссылку на себя
-
     text = (
         "Ок, давай свяжем тебя с дизайнером.\n\n"
         "Нажми на кнопку ниже, чтобы написать в личные сообщения:"
     )
     kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("Написать дизайнеру", url=designer_link))
+    kb.add(InlineKeyboardButton("Написать дизайнеру", url=DESIGNER_LINK))
     await message.answer(text, reply_markup=kb)
 
 
