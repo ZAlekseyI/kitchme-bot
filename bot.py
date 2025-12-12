@@ -10,6 +10,15 @@ from aiogram.types import (
     InlineKeyboardButton,
 )
 
+from aiohttp import web
+
+async def healthcheck(request):
+    return web.Response(text="OK")
+
+def setup_healthcheck(app):
+    app.router.add_get("/", healthcheck)
+    app.router.add_get("/health", healthcheck)
+
 # ---------- ЛОГИ ----------
 
 logging.basicConfig(level=logging.INFO)
