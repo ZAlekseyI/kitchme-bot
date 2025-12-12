@@ -3,21 +3,10 @@ import os
 
 import psycopg2
 from aiogram import Bot, Dispatcher, executor, types
-from aiogram.types import (
-    ReplyKeyboardMarkup,
-    KeyboardButton,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-)
-
-
-
-# ---------- ЛОГИ ----------
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
+from aiohttp import web
 
 logging.basicConfig(level=logging.INFO)
-logging.info("=== kitchME BOT STARTED IN WEBHOOK MODE ===")
-
-# ---------- НАСТРОЙКИ ----------
 
 API_TOKEN = os.environ.get("API_TOKEN")
 DATABASE_URL = os.environ.get("DATABASE_URL")
@@ -33,9 +22,7 @@ dp = Dispatcher(bot)
 DESIGNER_LINK = "https://t.me/kitchme_design"
 BONUS_LINK = "https://disk.yandex.ru/d/TeEMNTquvbJMjg"
 
-# URL сервиса на Render. В ENV добавлено:
-# WEBHOOK_HOST = https://kitchme-bot.onrender.com
-WEBHOOK_HOST = os.environ.get("WEBHOOK_HOST")
+WEBHOOK_HOST = os.environ.get("WEBHOOK_HOST")  # например https://kitchme-bot.onrender.com
 WEBHOOK_PATH = "/webhook"
 WEBHOOK_URL = (WEBHOOK_HOST or "").rstrip("/") + WEBHOOK_PATH
 
@@ -43,15 +30,11 @@ WEBAPP_HOST = "0.0.0.0"
 WEBAPP_PORT = int(os.environ.get("PORT", 8000))
 
 
-# ---------- БАЗА ДАННЫХ (PostgreSQL) ----------
-
 def get_conn():
-    """Подключение к PostgreSQL."""
     return psycopg2.connect(DATABASE_URL, sslmode="require")
 
 
 def init_db():
-    """Создаём таблицу users, если её ещё нет."""
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
@@ -73,7 +56,6 @@ def init_db():
 
 
 def add_or_update_user(user: types.User):
-    """Сохраняем пользователя в базу (или обновляем данные)."""
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
@@ -90,19 +72,14 @@ def add_or_update_user(user: types.User):
     conn.commit()
     cur.close()
     conn.close()
-    logging.info(f"Пользователь {user.id} сохранён/обновлён")
 
 
-# ---------- КЛАВИАТУРА ----------
-
-def main_menu() -> ReplyKeyboardMarkup:
+def main_menu():
     kb = ReplyKeyboardMarkup(resize_keyboard=True)
     kb.add(KeyboardButton("🎁 Забрать бонусы"))
     kb.add(KeyboardButton("📞 Получить консультацию дизайнера"))
     return kb
 
-
-# ---------- ХЕНДЛЕРЫ ----------
 
 @dp.message_handler(commands=["start"])
 async def cmd_start(message: types.Message):
@@ -114,8 +91,27 @@ async def cmd_start(message: types.Message):
         "ошибкам и полезным материалам.\n\n"
         "Выбери, что актуальнее:"
     )
-
     await message.answer(text, reply_markup=main_menu())
+
+
+@dp.message_handler(commands=["help"])
+async def cmd_help(message: types.Message):
+    await message.answer("Я помогу с кухней или шкафом на заказ. Нажмите /start чтобы открыть меню.")
+
+
+@dp.message_handler(commands=["about"])
+async def cmd_about(message: types.Message):
+    await message.answer("Я бот студии корпусной мебели kitchME. Собираю контакты и выдаю бонусы по кухне/шкафам.")
+
+
+@dp.message_handler(commands=["bonus"])
+async def cmd_bonus_cmd(message: types.Message):
+    await handle_bonuses(message)
+
+
+@dp.message_handler(commands=["consult"])
+async def cmd_consult_cmd(message: types.Message):
+    await handle_consult(message)
 
 
 @dp.message_handler(lambda m: m.text == "🎁 Забрать бонусы")
@@ -140,24 +136,6 @@ async def handle_consult(message: types.Message):
     kb.add(InlineKeyboardButton("Написать дизайнеру", url=DESIGNER_LINK))
     await message.answer(text, reply_markup=kb)
 
-@dp.message_handler(commands=["help"])
-async def cmd_help(message: types.Message):
-    await message.answer("Я помогу с кухней или шкафом на заказ. Нажмите /start чтобы открыть меню.")
-
-@dp.message_handler(commands=["about"])
-async def cmd_about(message: types.Message):
-    await message.answer("Я бот студии корпусной мебели kitchME. Выдаю бонусы и помогаю с выбором.")
-
-@dp.message_handler(commands=["bonus"])
-async def cmd_bonus_cmd(message: types.Message):
-    await handle_bonuses(message)
-
-@dp.message_handler(commands=["consult"])
-async def cmd_consult_cmd(message: types.Message):
-    await handle_consult(message)
-
-
-# ---------- СТАРТ / ОСТАНОВКА (WEBHOOK) ----------
 
 async def on_startup(dispatcher: Dispatcher):
     logging.info("Запуск бота, инициализация БД...")
@@ -167,7 +145,7 @@ async def on_startup(dispatcher: Dispatcher):
         logging.warning("WEBHOOK_HOST не задан, webhook НЕ будет установлен")
         return
 
-    await bot.delete_webhook()
+    await bot.delete_webhook(drop_pending_updates=True)
     await bot.set_webhook(WEBHOOK_URL)
     logging.info(f"Webhook установлен: {WEBHOOK_URL}")
 
@@ -177,16 +155,24 @@ async def on_shutdown(dispatcher: Dispatcher):
     await bot.delete_webhook()
     logging.info("Webhook удалён. Остановка бота.")
 
-from aiohttp import web
 
-async def healthcheck(request):
+# ---- Healthcheck endpoints (для Render / UptimeRobot) ----
+async def healthcheck(_request: web.Request):
     return web.Response(text="OK")
 
-def setup_healthcheck(app):
+
+def create_web_app() -> web.Application:
+    app = web.Application()
     app.router.add_get("/", healthcheck)
     app.router.add_get("/health", healthcheck)
-    
+    return app
+
+
 if __name__ == "__main__":
+    logging.info("=== kitchME BOT STARTED IN WEBHOOK MODE ===")
+
+    web_app = create_web_app()
+
     executor.start_webhook(
         dispatcher=dp,
         webhook_path=WEBHOOK_PATH,
@@ -195,5 +181,5 @@ if __name__ == "__main__":
         skip_updates=True,
         host=WEBAPP_HOST,
         port=WEBAPP_PORT,
-        setup_application=setup_healthcheck,
+        web_app=web_app,  # <-- вот так в aiogram 2.x
     )
