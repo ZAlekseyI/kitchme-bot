@@ -10,14 +10,7 @@ from aiogram.types import (
     InlineKeyboardButton,
 )
 
-from aiohttp import web
 
-async def healthcheck(request):
-    return web.Response(text="OK")
-
-def setup_healthcheck(app):
-    app.router.add_get("/", healthcheck)
-    app.router.add_get("/health", healthcheck)
 
 # ---------- ЛОГИ ----------
 
@@ -184,7 +177,15 @@ async def on_shutdown(dispatcher: Dispatcher):
     await bot.delete_webhook()
     logging.info("Webhook удалён. Остановка бота.")
 
+from aiohttp import web
 
+async def healthcheck(request):
+    return web.Response(text="OK")
+
+def setup_healthcheck(app):
+    app.router.add_get("/", healthcheck)
+    app.router.add_get("/health", healthcheck)
+    
 if __name__ == "__main__":
     executor.start_webhook(
         dispatcher=dp,
@@ -194,4 +195,5 @@ if __name__ == "__main__":
         skip_updates=True,
         host=WEBAPP_HOST,
         port=WEBAPP_PORT,
+        setup_application=setup_healthcheck,
     )
