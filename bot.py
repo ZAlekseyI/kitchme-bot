@@ -4,30 +4,32 @@ import os
 import psycopg2
 from aiogram import Bot, Dispatcher, executor, types
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
-from aiohttp import web
 
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
+# --- ENV ---
 API_TOKEN = os.environ.get("API_TOKEN")
 DATABASE_URL = os.environ.get("DATABASE_URL")
+WEBHOOK_HOST = os.environ.get("WEBHOOK_HOST")  # например: https://kitchme-bot.onrender.com
 
 if not API_TOKEN:
     raise ValueError("Не задан API_TOKEN в переменных окружения")
 if not DATABASE_URL:
     raise ValueError("Не задан DATABASE_URL в переменных окружения")
 
+WEBHOOK_PATH = "/webhook"
+WEBHOOK_URL = (WEBHOOK_HOST or "").rstrip("/") + WEBHOOK_PATH
+
+WEBAPP_HOST = "0.0.0.0"
+WEBAPP_PORT = int(os.environ.get("PORT", "10000"))
+
+# --- BOT ---
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher(bot)
 
 DESIGNER_LINK = "https://t.me/kitchme_design"
 BONUS_LINK = "https://disk.yandex.ru/d/TeEMNTquvbJMjg"
-
-WEBHOOK_HOST = os.environ.get("WEBHOOK_HOST")  # например https://kitchme-bot.onrender.com
-WEBHOOK_PATH = "/webhook"
-WEBHOOK_URL = (WEBHOOK_HOST or "").rstrip("/") + WEBHOOK_PATH
-
-WEBAPP_HOST = "0.0.0.0"
-WEBAPP_PORT = int(os.environ.get("PORT", 8000))
 
 
 def get_conn():
@@ -52,7 +54,7 @@ def init_db():
     conn.commit()
     cur.close()
     conn.close()
-    logging.info("Таблица users проверена/создана")
+    logger.info("Таблица users проверена/создана")
 
 
 def add_or_update_user(user: types.User):
@@ -101,7 +103,7 @@ async def cmd_help(message: types.Message):
 
 @dp.message_handler(commands=["about"])
 async def cmd_about(message: types.Message):
-    await message.answer("Я бот студии корпусной мебели kitchME. Собираю контакты и выдаю бонусы по кухне/шкафам.")
+    await message.answer("Я бот студии корпусной мебели kitchME. Выдаю бонусы и помогаю записаться на консультацию дизайнера.")
 
 
 @dp.message_handler(commands=["bonus"])
@@ -138,41 +140,26 @@ async def handle_consult(message: types.Message):
 
 
 async def on_startup(dispatcher: Dispatcher):
-    logging.info("Запуск бота, инициализация БД...")
+    logger.info("=== kitchME BOT STARTED IN WEBHOOK MODE ===")
+    logger.info("Запуск бота, инициализация БД...")
     init_db()
 
     if not WEBHOOK_HOST:
-        logging.warning("WEBHOOK_HOST не задан, webhook НЕ будет установлен")
+        logger.warning("WEBHOOK_HOST не задан, webhook НЕ будет установлен")
         return
 
     await bot.delete_webhook(drop_pending_updates=True)
     await bot.set_webhook(WEBHOOK_URL)
-    logging.info(f"Webhook установлен: {WEBHOOK_URL}")
+    logger.info(f"Webhook установлен: {WEBHOOK_URL}")
 
 
 async def on_shutdown(dispatcher: Dispatcher):
-    logging.info("Отключаем webhook...")
+    logger.info("Отключаем webhook...")
     await bot.delete_webhook()
-    logging.info("Webhook удалён. Остановка бота.")
-
-
-# ---- Healthcheck endpoints (для Render / UptimeRobot) ----
-async def healthcheck(_request: web.Request):
-    return web.Response(text="OK")
-
-
-def create_web_app() -> web.Application:
-    app = web.Application()
-    app.router.add_get("/", healthcheck)
-    app.router.add_get("/health", healthcheck)
-    return app
+    logger.info("Webhook удалён. Остановка бота.")
 
 
 if __name__ == "__main__":
-    logging.info("=== kitchME BOT STARTED IN WEBHOOK MODE ===")
-
-    web_app = create_web_app()
-
     executor.start_webhook(
         dispatcher=dp,
         webhook_path=WEBHOOK_PATH,
@@ -181,5 +168,4 @@ if __name__ == "__main__":
         skip_updates=True,
         host=WEBAPP_HOST,
         port=WEBAPP_PORT,
-        web_app=web_app,  # <-- вот так в aiogram 2.x
     )
