@@ -1,8 +1,7 @@
-import asyncio
-import json
-import logging
 import os
 import re
+import json
+import logging
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple, Dict
 
@@ -18,24 +17,25 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
 )
-from aiogram.utils.executor import start_webhook
 
 # =========================
-# CONFIG
+# LOGGING
 # =========================
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
+# =========================
+# ENV
+# =========================
 API_TOKEN = os.environ.get("API_TOKEN")
 DATABASE_URL = os.environ.get("DATABASE_URL")
-WEBHOOK_HOST = os.environ.get("WEBHOOK_HOST")  # e.g. https://kitchme-bot.onrender.com
+WEBHOOK_HOST = os.environ.get("WEBHOOK_HOST")  # https://kitchme-bot.onrender.com
 WEBHOOK_PATH = "/webhook"
 WEBHOOK_URL = (WEBHOOK_HOST or "").rstrip("/") + WEBHOOK_PATH
 
-WEBAPP_HOST = "0.0.0.0"
-WEBAPP_PORT = int(os.environ.get("PORT", "8000"))
+PORT = int(os.environ.get("PORT", "8000"))
+HOST = "0.0.0.0"
 
-# Optional: restrict /stats to you only
 ADMIN_USER_ID = os.environ.get("ADMIN_USER_ID")
 ADMIN_USER_ID = int(ADMIN_USER_ID) if ADMIN_USER_ID and ADMIN_USER_ID.isdigit() else None
 
@@ -49,45 +49,21 @@ if not DATABASE_URL:
 if not WEBHOOK_HOST:
     raise ValueError("Не задан WEBHOOK_HOST (например https://kitchme-bot.onrender.com)")
 
-
+# =========================
+# AIROGRAM
+# =========================
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher(bot)
 
-# Fixes context errors in webhook mode sometimes
+# важные фиксы контекста в webhook-режиме
 Bot.set_current(bot)
 Dispatcher.set_current(dp)
-
 
 # =========================
 # DB HELPERS
 # =========================
 def get_conn():
     return psycopg2.connect(DATABASE_URL, sslmode="require")
-
-
-def db_exec(sql: str, params=None):
-    conn = get_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(sql, params)
-        conn.commit()
-    finally:
-        conn.close()
-
-
-def table_exists(conn, table: str) -> bool:
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT EXISTS(
-              SELECT 1 FROM information_schema.tables
-              WHERE table_schema='public' AND table_name=%s
-            );
-            """,
-            (table,),
-        )
-        return bool(cur.fetchone()[0])
-
 
 def column_exists(conn, table: str, column: str) -> bool:
     with conn.cursor() as cur:
@@ -102,15 +78,15 @@ def column_exists(conn, table: str, column: str) -> bool:
         )
         return bool(cur.fetchone()[0])
 
-
 def ensure_db():
     """
-    Creates/migrates tables safely (no data loss).
+    Создаёт таблицы и аккуратно добавляет недостающие колонки.
+    Ничего не удаляет и не теряет данные.
     """
     conn = get_conn()
     try:
         with conn.cursor() as cur:
-            # users table
+            # users
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS users (
@@ -125,18 +101,18 @@ def ensure_db():
                 """
             )
 
-            # Add "first source" columns if missing
-            alter_users = []
+            # миграция users: first source columns
+            alters = []
             if not column_exists(conn, "users", "start_param_first"):
-                alter_users.append("ADD COLUMN start_param_first TEXT")
+                alters.append("ADD COLUMN start_param_first TEXT")
             if not column_exists(conn, "users", "source_first"):
-                alter_users.append("ADD COLUMN source_first TEXT")
+                alters.append("ADD COLUMN source_first TEXT")
             if not column_exists(conn, "users", "source_variant_first"):
-                alter_users.append("ADD COLUMN source_variant_first TEXT")
-            if alter_users:
-                cur.execute(f"ALTER TABLE users {', '.join(alter_users)};")
+                alters.append("ADD COLUMN source_variant_first TEXT")
+            if alters:
+                cur.execute(f"ALTER TABLE users {', '.join(alters)};")
 
-            # events table
+            # events
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS events (
@@ -148,50 +124,43 @@ def ensure_db():
                 """
             )
 
-            # Add analytics columns to events if missing
-            alter_events = []
+            # миграция events: analytics columns
+            alters = []
             if not column_exists(conn, "events", "start_param"):
-                alter_events.append("ADD COLUMN start_param TEXT")
+                alters.append("ADD COLUMN start_param TEXT")
             if not column_exists(conn, "events", "source"):
-                alter_events.append("ADD COLUMN source TEXT")
+                alters.append("ADD COLUMN source TEXT")
             if not column_exists(conn, "events", "source_variant"):
-                alter_events.append("ADD COLUMN source_variant TEXT")
-            if alter_events:
-                cur.execute(f"ALTER TABLE events {', '.join(alter_events)};")
+                alters.append("ADD COLUMN source_variant TEXT")
+            if alters:
+                cur.execute(f"ALTER TABLE events {', '.join(alters)};")
 
         conn.commit()
+        log.info("БД и таблицы готовы + миграция выполнена (если нужна)")
     finally:
         conn.close()
 
-
 def parse_start_param(sp: Optional[str]) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     """
-    sp example: youtube1, youtube2, vk, tg, bonus, instagram3
-    returns: (start_param, source, source_variant)
+    youtube2 -> (youtube2, youtube, 2)
+    vk -> (vk, vk, None)
+    unknown-format -> (raw, None, None)
     """
     if not sp:
         return None, None, None
-
     sp = sp.strip()
     if not sp:
         return None, None, None
 
     m = re.match(r"^([a-zA-Z_]+)(\d+)?$", sp)
     if not m:
-        # keep raw as start_param, source unknown
         return sp, None, None
 
     source = m.group(1).lower()
     variant = m.group(2)
     return sp, source, variant
 
-
 def save_user(user: types.User, start_param: Optional[str]):
-    """
-    - Upserts user basic info
-    - Fixes first source only once (doesn't overwrite)
-    - Updates last_seen_at always
-    """
     sp, source, variant = parse_start_param(start_param)
 
     conn = get_conn()
@@ -217,7 +186,6 @@ def save_user(user: types.User, start_param: Optional[str]):
     finally:
         conn.close()
 
-
 def log_event(telegram_id: int, event_type: str, start_param: Optional[str] = None):
     sp, source, variant = parse_start_param(start_param)
 
@@ -235,7 +203,6 @@ def log_event(telegram_id: int, event_type: str, start_param: Optional[str] = No
     finally:
         conn.close()
 
-
 # =========================
 # UI
 # =========================
@@ -245,21 +212,15 @@ def main_menu():
     kb.add(KeyboardButton("📞 Получить консультацию дизайнера"))
     return kb
 
-
 # =========================
-# HANDLERS
+# BOT HANDLERS
 # =========================
 @dp.message_handler(commands=["start"])
 async def cmd_start(message: types.Message):
-    # read deep link param
     start_param = None
-    try:
-        # /start xyz
-        parts = (message.text or "").split(maxsplit=1)
-        if len(parts) == 2:
-            start_param = parts[1].strip()
-    except Exception:
-        start_param = None
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) == 2:
+        start_param = parts[1].strip()
 
     save_user(message.from_user, start_param)
     log_event(message.from_user.id, "start", start_param=start_param)
@@ -272,26 +233,21 @@ async def cmd_start(message: types.Message):
     )
     await message.answer(text, reply_markup=main_menu())
 
-
 @dp.message_handler(commands=["help"])
 async def cmd_help(message: types.Message):
-    await message.answer("Я помогу с кухней или шкафом на заказ. Нажмите /start чтобы открыть меню.")
-
+    await message.answer("Нажмите /start чтобы открыть меню. Я помогу с кухней или шкафом на заказ.")
 
 @dp.message_handler(commands=["about"])
 async def cmd_about(message: types.Message):
-    await message.answer("Я бот студии корпусной мебели kitchME. Выдаю бонусы и помогаю связаться с дизайнером.")
-
+    await message.answer("Я бот студии корпусной мебели kitchME. Выдаю бонусы и связываю с дизайнером.")
 
 @dp.message_handler(commands=["bonus"])
-async def cmd_bonus_cmd(message: types.Message):
+async def cmd_bonus(message: types.Message):
     await handle_bonuses(message)
 
-
 @dp.message_handler(commands=["consult"])
-async def cmd_consult_cmd(message: types.Message):
+async def cmd_consult(message: types.Message):
     await handle_consult(message)
-
 
 @dp.message_handler(lambda m: m.text == "🎁 Забрать бонусы")
 async def handle_bonuses(message: types.Message):
@@ -300,37 +256,37 @@ async def handle_bonuses(message: types.Message):
         "🎁 Ваши бонусы готовы!\n\n"
         "Скачивайте по ссылке ниже ⤵️\n\n"
         f"{BONUS_LINK}\n\n"
-        "Есть вопросы по вашей кухне?\n"
-        "Наши дизайнеры готовы помочь — бесплатно."
+        "Если хотите — можно бесплатно проконсультироваться с дизайнером."
     )
     await message.answer(text)
-
 
 @dp.message_handler(lambda m: m.text == "📞 Получить консультацию дизайнера")
 async def handle_consult(message: types.Message):
     log_event(message.from_user.id, "consult")
     text = (
-        "Ок, давай свяжем тебя с дизайнером.\n\n"
-        "Нажми на кнопку ниже, чтобы написать в личные сообщения:"
+        "Ок, свяжем вас с дизайнером.\n\n"
+        "Нажмите кнопку ниже, чтобы написать в личные сообщения:"
     )
     kb = InlineKeyboardMarkup()
     kb.add(InlineKeyboardButton("Написать дизайнеру", url=DESIGNER_LINK))
     await message.answer(text, reply_markup=kb)
 
-
+# =========================
+# STATS (admin)
+# =========================
 def _utc_now():
     return datetime.now(timezone.utc)
 
+def _is_admin(user_id: int) -> bool:
+    if ADMIN_USER_ID is None:
+        return True
+    return user_id == ADMIN_USER_ID
 
 def stats_between(start_utc: datetime, end_utc: datetime):
-    """
-    Returns:
-      new_users, starts, bonus, consult, sources_dict
-    """
     conn = get_conn()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            # new users by created_at
+            # new users
             cur.execute(
                 """
                 SELECT COUNT(*)::int AS c
@@ -357,7 +313,6 @@ def stats_between(start_utc: datetime, end_utc: datetime):
             bonus = count_events("bonus")
             consult = count_events("consult")
 
-            # sources by first source from users (more stable)
             cur.execute(
                 """
                 SELECT COALESCE(source_first, 'unknown') AS source,
@@ -383,7 +338,6 @@ def stats_between(start_utc: datetime, end_utc: datetime):
     finally:
         conn.close()
 
-
 def format_stats(title: str, start_utc: datetime, end_utc: datetime) -> str:
     new_users, starts, bonus, consult, sources = stats_between(start_utc, end_utc)
 
@@ -397,12 +351,10 @@ def format_stats(title: str, start_utc: datetime, end_utc: datetime) -> str:
         "",
         "📌 Источники (первый заход):",
     ]
-
     if not sources:
         lines.append("— пока нет данных")
     else:
         for src, variants in sources.items():
-            # print like youtube: v1=10, v2=3
             parts = []
             for v, c in sorted(variants.items(), key=lambda x: (-x[1], x[0])):
                 if v == "0":
@@ -410,115 +362,87 @@ def format_stats(title: str, start_utc: datetime, end_utc: datetime) -> str:
                 else:
                     parts.append(f"{v}:{c}")
             lines.append(f"• {src} — " + ", ".join(parts))
-
     return "\n".join(lines)
-
-
-def _is_admin(user_id: int) -> bool:
-    if ADMIN_USER_ID is None:
-        return True  # if not set - allow (you can restrict later)
-    return user_id == ADMIN_USER_ID
-
 
 @dp.message_handler(commands=["stats"])
 async def cmd_stats(m: types.Message):
     if not _is_admin(m.from_user.id):
         return
-
-    # default = today (UTC day)
     now = _utc_now()
     start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     end = start + timedelta(days=1)
-
     log_event(m.from_user.id, "stats")
     await m.answer(format_stats("Сегодня", start, end))
-
-
-@dp.message_handler(commands=["stats_today"])
-async def cmd_stats_today(m: types.Message):
-    if not _is_admin(m.from_user.id):
-        return
-
-    now = _utc_now()
-    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    end = start + timedelta(days=1)
-
-    log_event(m.from_user.id, "stats")
-    await m.answer(format_stats("Сегодня", start, end))
-
 
 @dp.message_handler(commands=["stats_7d"])
 async def cmd_stats_7d(m: types.Message):
     if not _is_admin(m.from_user.id):
         return
-
     end = _utc_now()
     start = end - timedelta(days=7)
-
     log_event(m.from_user.id, "stats")
     await m.answer(format_stats("Последние 7 дней", start, end))
-
 
 @dp.message_handler(commands=["stats_30d"])
 async def cmd_stats_30d(m: types.Message):
     if not _is_admin(m.from_user.id):
         return
-
     end = _utc_now()
     start = end - timedelta(days=30)
-
     log_event(m.from_user.id, "stats")
     await m.answer(format_stats("Последние 30 дней", start, end))
 
-
 # =========================
-# AIOHTTP ROUTES
+# AIOHTTP APP
 # =========================
-async def health(request: web.Request):
-    return web.json_response({"status": "ok"})
-
-
-async def root(request: web.Request):
+async def handle_root(request: web.Request):
     return web.Response(text="ok")
 
+async def handle_health(request: web.Request):
+    return web.json_response({"status": "ok"})
 
-# =========================
-# WEBHOOK STARTUP/SHUTDOWN
-# =========================
-async def on_startup(dispatcher: Dispatcher):
-    ensure_db()
+async def handle_webhook(request: web.Request):
+    try:
+        data = await request.json()
+        update = types.Update(**data)
+
+        # на всякий случай фикс контекста для aiogram 2
+        Bot.set_current(bot)
+        Dispatcher.set_current(dp)
+
+        await dp.process_update(update)
+        return web.Response(text="ok")
+    except Exception as e:
+        log.exception("Ошибка обработки webhook: %s", e)
+        # Telegram всё равно нужен 200, иначе будет долбить ретраями
+        return web.Response(text="ok")
+
+async def on_startup(app: web.Application):
     log.info("=== kitchME BOT STARTED ===")
-    log.info("БД и таблицы готовы + миграция выполнена (если нужна)")
+    ensure_db()
 
+    # ставим webhook
     await bot.delete_webhook(drop_pending_updates=True)
     await bot.set_webhook(WEBHOOK_URL)
     log.info(f"Webhook установлен: {WEBHOOK_URL}")
 
+async def on_cleanup(app: web.Application):
+    # НЕ удаляем webhook на shutdown, иначе он будет слетать при деплоях/рестартах
+    log.info("Cleanup: завершаем работу (webhook не удаляем).")
 
-async def on_shutdown(dispatcher: Dispatcher):
-    # ВАЖНО: не трогай webhook на shutdown, иначе он будет слетать при каждом рестарте/деплое
-    # Render иногда шлёт SIGTERM при деплое/перезапуске => delete_webhook здесь = "бот молчит"
-    log.info("Shutdown: завершаем работу (webhook не удаляем).")
-
-
-def setup_app():
+def create_app() -> web.Application:
     app = web.Application()
-    # allow_head=True => HEAD работает автоматически (не надо add_head, иначе как у тебя было: "HEAD already registered")
-    app.router.add_get("/", root, allow_head=True)
-    app.router.add_get("/health", health, allow_head=True)
+    app.on_startup.append(on_startup)
+    app.on_cleanup.append(on_cleanup)
+
+    # allow_head=True => HEAD работает автоматически (не регистрируй add_head отдельно)
+    app.router.add_get("/", handle_root, allow_head=True)
+    app.router.add_get("/health", handle_health, allow_head=True)
+    app.router.add_post(WEBHOOK_PATH, handle_webhook)
+    # опционально: чтобы ручной GET /webhook не путал (просто ok)
+    app.router.add_get(WEBHOOK_PATH, lambda r: web.Response(text="ok"), allow_head=True)
+
     return app
 
-
 if __name__ == "__main__":
-    app = setup_app()
-
-    start_webhook(
-        dispatcher=dp,
-        webhook_path=WEBHOOK_PATH,
-        on_startup=on_startup,
-        on_shutdown=on_shutdown,
-        skip_updates=True,
-        host=WEBAPP_HOST,
-        port=WEBAPP_PORT,
-        web_app=app,  # aiogram 2.25.1 поддерживает web_app
-    )
+    web.run_app(create_app(), host=HOST, port=PORT)
