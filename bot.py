@@ -265,9 +265,7 @@ async def on_startup(dispatcher: Dispatcher):
 
 
 async def on_shutdown(dispatcher: Dispatcher):
-    log.info("Отключаем webhook...")
-    await bot.delete_webhook()
-    log.info("Webhook удалён. Остановка бота.")
+    log.info("Остановка бота (webhook НЕ удаляем)")
 
 
 # ----------------------------
