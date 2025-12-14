@@ -1,11 +1,12 @@
 import asyncio
-import json
 import logging
 import os
-from datetime import datetime, timedelta
-from typing import Optional, Tuple
+import re
+from datetime import datetime, timedelta, timezone
 
 import psycopg2
+from psycopg2.extras import RealDictCursor
+
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import (
     ReplyKeyboardMarkup,
@@ -15,30 +16,43 @@ from aiogram.types import (
 )
 from aiohttp import web
 
-try:
-    from zoneinfo import ZoneInfo  # py3.9+
-except Exception:
-    ZoneInfo = None  # fallback ниже
 
-
-# -------------------- CONFIG --------------------
+# ----------------------------
+# LOGGING
+# ----------------------------
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
+
+# ----------------------------
+# ENV
+# ----------------------------
 API_TOKEN = os.environ.get("API_TOKEN")
 DATABASE_URL = os.environ.get("DATABASE_URL")
-WEBHOOK_HOST = os.environ.get("WEBHOOK_HOST")  # https://kitchme-bot.onrender.com
-WEBHOOK_PATH = os.environ.get("WEBHOOK_PATH", "/webhook")  # оставь по умолчанию
-WEBHOOK_URL = (WEBHOOK_HOST or "").rstrip("/") + WEBHOOK_PATH
 
-PUBLISH_TOKEN = os.environ.get("PUBLISH_TOKEN")  # секрет для /publish
-CHANNEL_ID = os.environ.get("CHANNEL_ID")        # куда публиковать по умолчанию
-REPORT_CHAT_ID = os.environ.get("REPORT_CHAT_ID")  # куда слать отчёт в 21:00
+# Render: WEBHOOK_HOST должен быть вида https://kitchme-bot.onrender.com (без /webhook)
+WEBHOOK_HOST = os.environ.get("WEBHOOK_HOST", "").rstrip("/")
+WEBHOOK_PATH = os.environ.get("WEBHOOK_PATH", "/webhook")
+WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}" if WEBHOOK_HOST else ""
 
-TZ_NAME = os.environ.get("TZ", "Europe/Moscow")
+# Render port
+PORT = int(os.environ.get("PORT", "10000"))
+HOST = os.environ.get("HOST", "0.0.0.0")
 
-WEBAPP_HOST = "0.0.0.0"
-WEBAPP_PORT = int(os.environ.get("PORT", "8000"))
+# Куда слать ежедневную статистику (ID чата/канала)
+# - личка: твой user_id
+# - канал: отрицательный id вида -100xxxxxxxxxx
+REPORT_CHAT_ID = os.environ.get("REPORT_CHAT_ID")  # строкой, потом приведём к int
+
+# Время отчёта
+# По умолчанию: 21:00 по Москве (UTC+3). Можно поменять переменными окружения.
+REPORT_HOUR = int(os.environ.get("REPORT_HOUR", "21"))
+REPORT_MINUTE = int(os.environ.get("REPORT_MINUTE", "0"))
+REPORT_TZ_OFFSET_HOURS = int(os.environ.get("REPORT_TZ_OFFSET_HOURS", "3"))  # MSK = +3
+
+# Твои ссылки
+DESIGNER_LINK = os.environ.get("DESIGNER_LINK", "https://t.me/kitchme_design")
+BONUS_LINK = os.environ.get("BONUS_LINK", "https://disk.yandex.ru/d/TeEMNTquvbJMjg")
 
 
 if not API_TOKEN:
@@ -46,28 +60,28 @@ if not API_TOKEN:
 if not DATABASE_URL:
     raise ValueError("Не задан DATABASE_URL в переменных окружения")
 
-# Для публикации и отчётов эти два параметра крайне желательны
-if not PUBLISH_TOKEN:
-    log.warning("PUBLISH_TOKEN не задан — эндпоинт /publish будет недоступен.")
-if not CHANNEL_ID:
-    log.warning("CHANNEL_ID не задан — /publish без channel_id не сможет публиковать.")
-if not REPORT_CHAT_ID:
-    log.warning("REPORT_CHAT_ID не задан — ежедневный отчёт отправляться не будет.")
 
-
+# ----------------------------
+# AIORAM BOT + DISPATCHER
+# ----------------------------
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher(bot)
 
-DESIGNER_LINK = "https://t.me/kitchme_design"
-BONUS_LINK = "https://disk.yandex.ru/d/TeEMNTquvbJMjg"
+# Критично для ручного webhook-обработчика:
+Bot.set_current(bot)
+Dispatcher.set_current(dp)
 
 
-# -------------------- DB --------------------
+# ----------------------------
+# DB HELPERS
+# ----------------------------
 def get_conn():
+    # sslmode=require — норм для Render Postgres/Managed Postgres
     return psycopg2.connect(DATABASE_URL, sslmode="require")
 
 
 def init_db():
+    """Создаём таблицы и делаем мягкую миграцию (добавляем колонки, если их нет)."""
     conn = get_conn()
     cur = conn.cursor()
 
@@ -80,29 +94,27 @@ def init_db():
             username TEXT,
             first_name TEXT,
             last_name TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            first_seen_at TIMESTAMP,
+            last_seen_at TIMESTAMP,
+            start_param TEXT,
+            source TEXT,
+            source_variant TEXT
         );
         """
     )
 
-    # Мягкая миграция (добавляем колонки, если их нет)
-    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS first_seen_at TIMESTAMP;")
-    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMP;")
-    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS start_param TEXT;")
-    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS source TEXT;")
-    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS source_variant TEXT;")
-
-    # events
+    # events (для аналитики действий)
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS events (
             id SERIAL PRIMARY KEY,
             telegram_id BIGINT,
             event_type TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            start_param TEXT,
             source TEXT,
-            source_variant TEXT,
-            meta JSONB,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            source_variant TEXT
         );
         """
     )
@@ -110,102 +122,112 @@ def init_db():
     conn.commit()
     cur.close()
     conn.close()
-    log.info("Таблица users проверена/создана и мигрирована (если нужно)")
+    log.info("Таблица users/events проверена/создана")
 
 
-def parse_start_param(param: Optional[str]) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+def _parse_start_param(param: str | None):
     """
-    youtube2 -> (youtube2, youtube, 2)
-    vk -> (vk, vk, None)
+    Примеры:
+      youtube1 -> source=youtube, variant=1
+      vk -> source=vk, variant=None
+      instagram2 -> source=instagram, variant=2
     """
     if not param:
         return None, None, None
 
-    p = param.strip().lower()
-    if not p:
-        return None, None, None
+    p = param.strip()
+    m = re.match(r"^([a-zA-Z_]+)(\d+)?$", p)
+    if not m:
+        return p, None, None
 
-    # отделим trailing digits
-    i = len(p)
-    while i > 0 and p[i - 1].isdigit():
-        i -= 1
-
-    source = p[:i] if i < len(p) else p
-    variant = p[i:] if i < len(p) and p[i:].isdigit() else None
+    source = m.group(1).lower()
+    variant = m.group(2) if m.group(2) else None
     return p, source, variant
 
 
-def upsert_user(user: types.User, start_param: Optional[str] = None):
+def upsert_user(user: types.User, start_param: str | None):
+    """
+    Важно:
+    - first_seen_at и "первый источник" фиксируем один раз
+    - last_seen_at обновляем всегда
+    - start_param/source/source_variant записываем только если пусто (чтобы не перетирало первый источник)
+    """
+    sp, src, var = _parse_start_param(start_param)
     now = datetime.utcnow()
-    sp, src, var = parse_start_param(start_param)
 
     conn = get_conn()
     cur = conn.cursor()
 
-    # создаём или обновляем базовые данные
-    cur.execute(
-        """
-        INSERT INTO users (telegram_id, username, first_name, last_name, first_seen_at, last_seen_at, start_param, source, source_variant)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (telegram_id) DO UPDATE SET
-            username = EXCLUDED.username,
-            first_name = EXCLUDED.first_name,
-            last_name = EXCLUDED.last_name,
-            last_seen_at = EXCLUDED.last_seen_at
-        RETURNING first_seen_at, start_param, source, source_variant;
-        """,
-        (user.id, user.username, user.first_name, user.last_name, now, now, sp, src, var),
-    )
-
-    # важно: не перетирать "первый источник", если уже был
+    cur.execute("SELECT telegram_id, first_seen_at, start_param, source, source_variant FROM users WHERE telegram_id=%s",
+                (user.id,))
     row = cur.fetchone()
-    existing_start_param = row[1] if row else None
-    existing_source = row[2] if row else None
-    existing_variant = row[3] if row else None
 
-    if (existing_start_param is None) and sp is not None:
+    if row is None:
+        cur.execute(
+            """
+            INSERT INTO users (telegram_id, username, first_name, last_name, first_seen_at, last_seen_at, start_param, source, source_variant)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (user.id, user.username, user.first_name, user.last_name, now, now, sp, src, var),
+        )
+    else:
+        # Обновляем базовые поля и last_seen_at
         cur.execute(
             """
             UPDATE users
-            SET start_param=%s, source=%s, source_variant=%s
-            WHERE telegram_id=%s;
+            SET username=%s, first_name=%s, last_name=%s, last_seen_at=%s
+            WHERE telegram_id=%s
             """,
-            (sp, src, var, user.id),
+            (user.username, user.first_name, user.last_name, now, user.id),
         )
+        # Если источник ещё не зафиксирован — фиксируем
+        existing_start_param = row[2]
+        if (existing_start_param is None) and sp:
+            cur.execute(
+                """
+                UPDATE users
+                SET start_param=%s, source=%s, source_variant=%s
+                WHERE telegram_id=%s
+                """,
+                (sp, src, var, user.id),
+            )
 
     conn.commit()
     cur.close()
     conn.close()
 
 
-def log_event(telegram_id: int, event_type: str, source: Optional[str], source_variant: Optional[str], meta: Optional[dict] = None):
+def log_event(telegram_id: int, event_type: str, start_param: str | None = None):
+    sp, src, var = _parse_start_param(start_param)
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
         """
-        INSERT INTO events (telegram_id, event_type, source, source_variant, meta)
-        VALUES (%s, %s, %s, %s, %s);
+        INSERT INTO events (telegram_id, event_type, start_param, source, source_variant)
+        VALUES (%s, %s, %s, %s, %s)
         """,
-        (telegram_id, event_type, source, source_variant, json.dumps(meta or {})),
+        (telegram_id, event_type, sp, src, var),
     )
     conn.commit()
     cur.close()
     conn.close()
 
 
-def get_user_source(telegram_id: int) -> Tuple[Optional[str], Optional[str]]:
+def get_user_first_source(telegram_id: int):
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("SELECT source, source_variant FROM users WHERE telegram_id=%s;", (telegram_id,))
+    cur.execute("SELECT start_param, source, source_variant FROM users WHERE telegram_id=%s", (telegram_id,))
     row = cur.fetchone()
     cur.close()
     conn.close()
     if not row:
-        return None, None
-    return row[0], row[1]
+        return None, None, None
+    return row[0], row[1], row[2]
 
 
-# -------------------- UI --------------------
+# ----------------------------
+# UI / MENUS
+# ----------------------------
 def main_menu():
     kb = ReplyKeyboardMarkup(resize_keyboard=True)
     kb.add(KeyboardButton("🎁 Забрать бонусы"))
@@ -213,15 +235,17 @@ def main_menu():
     return kb
 
 
-# -------------------- HANDLERS --------------------
+# ----------------------------
+# HANDLERS
+# ----------------------------
 @dp.message_handler(commands=["start"])
 async def cmd_start(message: types.Message):
-    # start-param из deep link: t.me/xxx?start=youtube2
-    start_param = message.get_args()  # aiogram v2
-    upsert_user(message.from_user, start_param=start_param)
+    # start_param приходит как /start youtube2
+    start_param = message.get_args() if hasattr(message, "get_args") else None
+    upsert_user(message.from_user, start_param)
 
-    src, var = get_user_source(message.from_user.id)
-    log_event(message.from_user.id, "start", src, var, meta={"start_param": start_param})
+    # событие start логируем с тем start_param, который пришёл в этот запуск
+    log_event(message.from_user.id, "start", start_param=start_param)
 
     text = (
         "Привет! Я бот студии корпусной мебели kitchME.\n\n"
@@ -239,7 +263,7 @@ async def cmd_help(message: types.Message):
 
 @dp.message_handler(commands=["about"])
 async def cmd_about(message: types.Message):
-    await message.answer("Я бот студии корпусной мебели kitchME. Выдаю бонусы и помогаю получить консультацию дизайнера.")
+    await message.answer("Я бот студии корпусной мебели kitchME. Выдаю бонусы и собираю аналитику по источникам трафика.")
 
 
 @dp.message_handler(commands=["bonus"])
@@ -254,8 +278,9 @@ async def cmd_consult_cmd(message: types.Message):
 
 @dp.message_handler(lambda m: m.text == "🎁 Забрать бонусы")
 async def handle_bonuses(message: types.Message):
-    src, var = get_user_source(message.from_user.id)
-    log_event(message.from_user.id, "bonus", src, var)
+    # логируем бонус по "первому источнику" пользователя
+    sp, _, _ = get_user_first_source(message.from_user.id)
+    log_event(message.from_user.id, "bonus", start_param=sp)
 
     text = (
         "🎁 Ваши бонусы готовы!\n\n"
@@ -269,8 +294,8 @@ async def handle_bonuses(message: types.Message):
 
 @dp.message_handler(lambda m: m.text == "📞 Получить консультацию дизайнера")
 async def handle_consult(message: types.Message):
-    src, var = get_user_source(message.from_user.id)
-    log_event(message.from_user.id, "consult", src, var)
+    sp, _, _ = get_user_first_source(message.from_user.id)
+    log_event(message.from_user.id, "consult", start_param=sp)
 
     text = (
         "Ок, давай свяжем тебя с дизайнером.\n\n"
@@ -281,278 +306,212 @@ async def handle_consult(message: types.Message):
     await message.answer(text, reply_markup=kb)
 
 
-# -------------------- AIOHTTP APP (webhook + health + publish) --------------------
-async def health_handler(request: web.Request):
-    return web.Response(text="OK")
+# ----------------------------
+# HEALTH ENDPOINT (для UptimeRobot)
+# ----------------------------
+async def health_handler(request: web.Request) -> web.Response:
+    # Должно отвечать и на GET, и на HEAD
+    return web.Response(text="ok")
 
 
-async def webhook_handler(request: web.Request):
-    # Telegram шлёт POST с update
-    if request.method == "POST":
-        try:
-            data = await request.json()
-            update = types.Update.to_object(data)
-            await dp.process_update(update)
-        except Exception as e:
-            log.exception("Ошибка обработки webhook: %s", e)
-        return web.Response(text="OK")
-
-    # Для UptimeRobot/браузера
-    return web.Response(text="OK")
-
-
-async def publish_handler(request: web.Request):
-    """
-    POST /publish?token=...  или header: X-Publish-Token
-    JSON:
-    {
-      "channel_id": "@mychannel" (optional, иначе CHANNEL_ID),
-      "text": "....",
-      "parse_mode": "HTML" (optional),
-      "disable_web_page_preview": true (optional),
-      "photo": "https://..." (optional)
-    }
-    """
-    if not PUBLISH_TOKEN:
-        return web.json_response({"ok": False, "error": "PUBLISH_TOKEN not set"}, status=503)
-
-    token = request.query.get("token") or request.headers.get("X-Publish-Token")
-    if token != PUBLISH_TOKEN:
-        return web.json_response({"ok": False, "error": "Unauthorized"}, status=401)
-
+# ----------------------------
+# WEBHOOK ENDPOINT (Telegram -> POST)
+# ----------------------------
+async def webhook_handler(request: web.Request) -> web.Response:
+    # Telegram шлёт POST JSON
     try:
-        payload = await request.json()
-    except Exception:
-        return web.json_response({"ok": False, "error": "Invalid JSON"}, status=400)
+        if request.method in ("GET", "HEAD"):
+            # Нормально, но это не для Telegram.
+            return web.Response(text="ok")
 
-    channel_id = payload.get("channel_id") or CHANNEL_ID
-    text = payload.get("text")
-    parse_mode = payload.get("parse_mode")
-    disable_preview = bool(payload.get("disable_web_page_preview", True))
-    photo = payload.get("photo")
+        data = await request.json()
 
-    if not channel_id:
-        return web.json_response({"ok": False, "error": "channel_id not provided and CHANNEL_ID not set"}, status=400)
-    if not text and not photo:
-        return web.json_response({"ok": False, "error": "text or photo required"}, status=400)
+        # ВАЖНО: контекст на каждый апдейт (фикс твоей ошибки)
+        Bot.set_current(bot)
+        Dispatcher.set_current(dp)
 
-    try:
-        if photo:
-            await bot.send_photo(chat_id=channel_id, photo=photo, caption=text or "", parse_mode=parse_mode)
-        else:
-            await bot.send_message(chat_id=channel_id, text=text, parse_mode=parse_mode, disable_web_page_preview=disable_preview)
+        update = types.Update.to_object(data)
+        await dp.process_update(update)
 
-        # логируем событие publish (без telegram_id клиента — это сервисная публикация)
-        log_event(telegram_id=0, event_type="publish", source=None, source_variant=None, meta={"channel_id": str(channel_id)})
-        return web.json_response({"ok": True})
+        return web.Response(text="ok")
     except Exception as e:
-        log.exception("Ошибка publish: %s", e)
-        return web.json_response({"ok": False, "error": str(e)}, status=500)
+        log.exception(f"Ошибка обработки webhook: {e}")
+        # 200 чтобы Telegram не долбил бесконечно при твоих внутренних ошибках
+        return web.Response(text="error", status=200)
 
 
-def make_app() -> web.Application:
-    app = web.Application()
-    app.router.add_route("GET", "/", health_handler)
-    app.router.add_route("HEAD", "/", health_handler)
-    app.router.add_route("GET", "/health", health_handler)
-    app.router.add_route("HEAD", "/health", health_handler)
-
-    app.router.add_route("POST", WEBHOOK_PATH, webhook_handler)
-    app.router.add_route("GET", WEBHOOK_PATH, webhook_handler)
-    app.router.add_route("HEAD", WEBHOOK_PATH, webhook_handler)
-
-    app.router.add_route("POST", "/publish", publish_handler)
-    return app
-
-
-# -------------------- DAILY REPORT --------------------
-def _get_tz():
-    if ZoneInfo:
-        try:
-            return ZoneInfo(TZ_NAME)
-        except Exception:
-            pass
-    # fallback: Москва = UTC+3
-    class _FixedTZ:
-        def utcoffset(self, dt): return timedelta(hours=3)
-        def tzname(self, dt): return "UTC+3"
-        def dst(self, dt): return timedelta(0)
-    return _FixedTZ()
-
-
-def _moscow_now():
-    tz = _get_tz()
+# ----------------------------
+# DAILY REPORT (21:00 MSK по умолчанию)
+# ----------------------------
+def _tz_now():
+    tz = timezone(timedelta(hours=REPORT_TZ_OFFSET_HOURS))
     return datetime.now(tz)
 
 
-def _utc_from_local(dt_local: datetime) -> datetime:
-    # dt_local aware
-    return dt_local.astimezone(ZoneInfo("UTC")) if ZoneInfo else dt_local - timedelta(hours=3)
-
-
-def build_daily_report(date_local: datetime) -> str:
+def _range_for_today_utc():
     """
-    date_local: локальная дата (Москва)
-    Отчёт за текущий день 00:00-23:59 (Мск)
+    Возвращаем (start_utc, end_utc) для "сегодня" в REPORT TZ.
     """
-    tz = _get_tz()
-    start_local = date_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    tz = timezone(timedelta(hours=REPORT_TZ_OFFSET_HOURS))
+    now_local = datetime.now(tz)
+    start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
     end_local = start_local + timedelta(days=1)
+    return start_local.astimezone(timezone.utc).replace(tzinfo=None), end_local.astimezone(timezone.utc).replace(tzinfo=None)
 
-    # переведём границы в UTC для сравнения с created_at (у нас UTC-naive в БД обычно)
-    # В Postgres created_at DEFAULT CURRENT_TIMESTAMP — обычно в UTC на Render.
-    start_utc = _utc_from_local(start_local).replace(tzinfo=None)
-    end_utc = _utc_from_local(end_local).replace(tzinfo=None)
+
+def _fetch_daily_stats():
+    start_utc, end_utc = _range_for_today_utc()
 
     conn = get_conn()
-    cur = conn.cursor()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
 
-    # всего уникальных пользователей, кто нажал /start сегодня
+    # Общие
     cur.execute(
         """
-        SELECT COUNT(DISTINCT telegram_id)
+        SELECT
+          COUNT(*) FILTER (WHERE event_type='start')  AS starts,
+          COUNT(*) FILTER (WHERE event_type='bonus')  AS bonuses,
+          COUNT(*) FILTER (WHERE event_type='consult') AS consults
         FROM events
-        WHERE event_type='start'
-          AND telegram_id <> 0
-          AND created_at >= %s AND created_at < %s;
+        WHERE created_at >= %s AND created_at < %s
         """,
         (start_utc, end_utc),
     )
-    uniq_starts = cur.fetchone()[0] or 0
+    totals = cur.fetchone() or {"starts": 0, "bonuses": 0, "consults": 0}
 
-    # события
-    def count_event(ev: str) -> int:
-        cur.execute(
-            """
-            SELECT COUNT(*)
-            FROM events
-            WHERE event_type=%s
-              AND created_at >= %s AND created_at < %s;
-            """,
-            (ev, start_utc, end_utc),
-        )
-        return cur.fetchone()[0] or 0
-
-    bonus_cnt = count_event("bonus")
-    consult_cnt = count_event("consult")
-
-    # по источникам (по /start)
+    # По источникам (берём source из события)
     cur.execute(
         """
-        SELECT COALESCE(source, 'unknown') AS src, COALESCE(source_variant, '-') AS var, COUNT(*) AS cnt
+        SELECT COALESCE(source, 'unknown') AS source, COUNT(*) AS cnt
         FROM events
-        WHERE event_type='start'
-          AND telegram_id <> 0
-          AND created_at >= %s AND created_at < %s
-        GROUP BY src, var
-        ORDER BY cnt DESC;
+        WHERE event_type='start' AND created_at >= %s AND created_at < %s
+        GROUP BY COALESCE(source, 'unknown')
+        ORDER BY cnt DESC
         """,
         (start_utc, end_utc),
     )
-    rows = cur.fetchall()
+    by_source = cur.fetchall() or []
+
+    # По source+variant (start_param)
+    cur.execute(
+        """
+        SELECT COALESCE(start_param, 'unknown') AS start_param, COUNT(*) AS cnt
+        FROM events
+        WHERE event_type='start' AND created_at >= %s AND created_at < %s
+        GROUP BY COALESCE(start_param, 'unknown')
+        ORDER BY cnt DESC
+        LIMIT 30
+        """,
+        (start_utc, end_utc),
+    )
+    by_param = cur.fetchall() or []
 
     cur.close()
     conn.close()
 
-    date_str = start_local.strftime("%d.%m.%Y")
-
-    lines = [
-        f"📊 Отчёт kitchME за {date_str} (Мск)",
-        "",
-        f"👤 Новых/активных по /start: {uniq_starts}",
-        f"🎁 Запросили бонусы: {bonus_cnt}",
-        f"📞 Запросили консультацию: {consult_cnt}",
-        "",
-        "📌 Источники (по /start):",
-    ]
-
-    if not rows:
-        lines.append("— нет данных")
-    else:
-        for src, var, cnt in rows:
-            # пример: youtube / 2 — 5
-            if var == "-" or var is None:
-                lines.append(f"— {src}: {cnt}")
-            else:
-                lines.append(f"— {src}{var}: {cnt}")
-
-    return "\n".join(lines)
+    return totals, by_source, by_param
 
 
-async def report_scheduler():
+async def daily_report_loop():
     if not REPORT_CHAT_ID:
+        log.warning("REPORT_CHAT_ID не задан — ежедневная статистика отключена")
         return
 
-    tz = _get_tz()
+    chat_id = int(REPORT_CHAT_ID)
 
     while True:
-        now = _moscow_now()
-
-        # следующий запуск сегодня 21:00, или завтра 21:00
-        target = now.replace(hour=21, minute=0, second=0, microsecond=0)
-        if now >= target:
-            target = target + timedelta(days=1)
-
-        seconds = (target - now).total_seconds()
-        await asyncio.sleep(max(1, int(seconds)))
-
         try:
-            # отчёт за текущий день (по Москве)
-            today_local = _moscow_now()
-            report = build_daily_report(today_local)
-            await bot.send_message(chat_id=REPORT_CHAT_ID, text=report)
+            now = _tz_now()
+            target = now.replace(hour=REPORT_HOUR, minute=REPORT_MINUTE, second=0, microsecond=0)
+            if target <= now:
+                target += timedelta(days=1)
+
+            sleep_seconds = (target - now).total_seconds()
+            await asyncio.sleep(sleep_seconds)
+
+            totals, by_source, by_param = _fetch_daily_stats()
+
+            lines = []
+            lines.append("📊 kitchME — отчёт за сегодня")
+            lines.append("")
+            lines.append(f"👤 Стартов: {totals.get('starts', 0)}")
+            lines.append(f"🎁 Бонусы: {totals.get('bonuses', 0)}")
+            lines.append(f"📞 Консультации: {totals.get('consults', 0)}")
+            lines.append("")
+            lines.append("Источники (start):")
+            if by_source:
+                for r in by_source:
+                    lines.append(f"• {r['source']}: {r['cnt']}")
+            else:
+                lines.append("• нет данных")
+            lines.append("")
+            lines.append("Параметры (start_param):")
+            if by_param:
+                for r in by_param:
+                    lines.append(f"• {r['start_param']}: {r['cnt']}")
+            else:
+                lines.append("• нет данных")
+
+            await bot.send_message(chat_id=chat_id, text="\n".join(lines))
+            log.info("Ежедневный отчёт отправлен")
         except Exception as e:
-            log.exception("Ошибка отправки отчёта: %s", e)
-
-        # небольшая пауза чтобы не словить дубль
-        await asyncio.sleep(5)
+            log.exception(f"Ошибка ежедневного отчёта: {e}")
+            await asyncio.sleep(30)
 
 
-# -------------------- STARTUP / SHUTDOWN --------------------
+# ----------------------------
+# STARTUP / SHUTDOWN
+# ----------------------------
 async def on_startup(app: web.Application):
-    log.info("=== kitchME BOT STARTED IN WEBHOOK MODE ===")
     init_db()
 
-    if not WEBHOOK_HOST:
-        log.warning("WEBHOOK_HOST не задан — webhook не будет установлен!")
-        return
-
-    # Ставим webhook. Важно: НЕ делать delete_webhook на shutdown (иначе url будет пустой).
-    try:
+    # Ставим webhook только если задан WEBHOOK_HOST
+    if not WEBHOOK_URL:
+        log.warning("WEBHOOK_HOST не задан — webhook не будет установлен")
+    else:
+        # drop_pending_updates=True, чтобы не ловить хвост старых апдейтов
+        await bot.delete_webhook(drop_pending_updates=True)
         await bot.set_webhook(WEBHOOK_URL)
         log.info(f"Webhook установлен: {WEBHOOK_URL}")
-    except Exception as e:
-        log.exception("Не удалось установить webhook: %s", e)
 
-    # запускаем ежедневный отчёт
-    app["report_task"] = asyncio.create_task(report_scheduler())
+    # запуск ежедневного отчёта
+    app["daily_report_task"] = asyncio.create_task(daily_report_loop())
 
 
 async def on_shutdown(app: web.Application):
-    log.info("Остановка сервиса. Закрываем сессию бота и фоновые задачи...")
-
-    task = app.get("report_task")
+    # ВАЖНО: НЕ удаляем webhook на shutdown (иначе url станет пустым и бот отвалится)
+    log.info("Shutdown: останавливаем фоновые задачи...")
+    task = app.get("daily_report_task")
     if task:
         task.cancel()
         try:
             await task
-        except Exception:
+        except asyncio.CancelledError:
             pass
-
-    # ВАЖНО: webhook не удаляем, чтобы Telegram не сбрасывал URL в пустой.
-    # Просто закрываем сессию.
-    await bot.session.close()
-    log.info("Остановлено.")
+    log.info("Shutdown завершён.")
 
 
-# -------------------- MAIN --------------------
-def main():
-    app = make_app()
+# ----------------------------
+# AIOHTTP APP
+# ----------------------------
+def create_app() -> web.Application:
+    app = web.Application()
+
+    # /health — для UptimeRobot (GET/HEAD)
+    app.router.add_route("GET", "/health", health_handler)
+    app.router.add_route("HEAD", "/health", health_handler)
+
+    # webhook — Telegram будет слать POST сюда
+    app.router.add_route("POST", WEBHOOK_PATH, webhook_handler)
+    # можно отвечать и на HEAD/GET, чтобы UptimeRobot не ругался если ткнули сюда
+    app.router.add_route("GET", WEBHOOK_PATH, webhook_handler)
+    app.router.add_route("HEAD", WEBHOOK_PATH, webhook_handler)
+
     app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown)
-
-    web.run_app(app, host=WEBAPP_HOST, port=WEBAPP_PORT)
+    return app
 
 
 if __name__ == "__main__":
-    main()
+    log.info("=== kitchME BOT STARTED IN WEBHOOK MODE ===")
+    web.run_app(create_app(), host=HOST, port=PORT)
